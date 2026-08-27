@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Öffnet eine Claude-Code-Session in einem neuen Terminalfenster.
+
+Aufruf entweder direkt mit einer Session-ID oder über das URI-Schema,
+das der Desktop-Handler durchreicht:
+
+    claude-session-open 11111111
+    claude-session-open claude-session://11111111-2222-3333-4444-555555555555
+
+Die ID darf abgekürzt werden, solange sie eindeutig bleibt — genau die
+acht Zeichen, die die Übersicht anzeigt, reichen also.
+
+Das Arbeitsverzeichnis wird aus der Session-Datei gelesen und nicht aus
+dem Verzeichnisnamen abgeleitet: die Kodierung '/' -> '-' ist nicht
+umkehrbar. Claude startet damit im selben Verzeichnis wie damals.
+
+Eigenständiges Kommandozeilenwerkzeug: die Meldungen stehen hier und
+nicht in `claude_sessions/texte.py` — die Tabelle dort gehört der GTK-
+Oberfläche. Grundsprache ist wie im übrigen Repo Englisch.
+"""
+
+import datetime
+import glob
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from urllib.parse import unquote, urlparse
+
+ROOT = os.path.expanduser("~/.claude/projects")
+
+#: Terminal-Emulatoren in der Reihenfolge, in der sie probiert werden.
+#: Keiner davon ist Voraussetzung — genommen wird der erste, den `which`
+#: im PATH findet; wird keiner gefunden, sagt das Programm genau das (und
+#: welche es gesucht hat), statt still nichts zu tun.
+TERMINALS = ("qterminal", "x-terminal-emulator", "xfce4-terminal",
+             "konsole", "xterm")
+
+#: Emulatoren, die das Kommando nicht als Argumentliste hinter '-e' nehmen.
+_TERMINAL_ARGS = {"xfce4-terminal": "--command"}
+
+
+def state_dir():
+    """Verzeichnis für das gemeinsame Ereignislog.
+
+    Vorgabe ist ``~/.local/state/claude-sessions``; ``XDG_STATE_HOME``
+    verschiebt es. Relative Werte ignoriert die XDG-Spezifikation
+    ausdrücklich — ein Log an wechselnden Orten wäre schlimmer als keins.
+    Zur Laufzeit ausgewertet, damit ein Aufrufer die Umgebung noch setzen
+    kann, nachdem das Modul geladen ist.
+    """
+    base = os.environ.get("XDG_STATE_HOME", "")
+    if not base.startswith("/"):
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "claude-sessions")
+
+
+def log_file():
+    return os.path.join(state_dir(), "events.log")
+
+
+def autonomous():
+    """Laeuft dieser Aufruf in einem unbeaufsichtigten Kontext?
+
+    Unter systemd (INVOCATION_ID), ohne X-Anzeige oder per ausdruecklichem
+    Schalter darf nichts erscheinen, worauf jemand klicken muesste — sonst
+    haengt der Prozess an einem Dialog, den niemand sieht.
+
+    CLAUDE_SESSIONS_INTERACTIVE hebelt die INVOCATION_ID-Regel aus. Die
+    Uebersicht startet ihre Fenster naemlich als transiente systemd-Unit
+    (damit sie nicht in ihrer cgroup haengen), und die setzt INVOCATION_ID.
+    Ohne diese Ausnahme galt jeder Klick auf 'Öffnen' als unbeaufsichtigt:
+    scheiterte er, stand der Grund nur im Logfile und der Benutzer sah nach
+    dem Klick schlicht nichts passieren. Ohne Anzeige bleibt es still, da
+    kann ohnehin keine Meldung ankommen.
+    """
+    if os.environ.get("CLAUDE_SESSIONS_AUTONOMOUS") or not os.environ.get("DISPLAY"):
+        return True
+    if os.environ.get("CLAUDE_SESSIONS_INTERACTIVE"):
+        return False
+    return bool(os.environ.get("INVOCATION_ID"))
+
+
+def log(msg, level="INFO", tag="claude-session-open"):
+    """Ereignis mit Zeitstempel ins gemeinsame Logfile schreiben.
+
+    Einzige Meldungsquelle, die in jedem Kontext funktioniert: Terminal,
+    Desktop-Handler und systemd-Dienst schreiben in dieselbe Datei.
+    """
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    line = "%s %-5s [%s] %s\n" % (stamp, level, tag, " ".join(msg.split()))
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        with open(log_file(), "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        # Logging darf den eigentlichen Zweck nie verhindern.
+        pass
+
+
+def die(msg, rc=1):
+    """Fehler melden und beenden.
+
+    rc=2 kennzeichnet einen Bedienfehler (falsche oder fehlende ID), rc=1
+    einen Systemfehler. Ein Aufrufer kann damit unterscheiden, ob er den
+    Benutzer erneut fragen oder aufgeben sollte.
+
+    Bewusst OHNE zenity/kdialog/xmessage: die blockieren bis jemand klickt
+    und wuerden einen unbeaufsichtigten Aufruf endlos haengen lassen. Das
+    Logfile ist der verlaessliche Kanal, notify-send die sichtbare Zugabe
+    fuer den Desktop — es kehrt sofort zurueck.
+    """
+    sys.stderr.write("claude-session-open: %s\n" % msg)
+    log(msg, level="ERROR")
+    if not autonomous() and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-u", "critical", "-a", "Claude Session",
+                        "Claude Session", msg], check=False)
+    raise SystemExit(rc)
+
+
+def session_id(arg):
+    """Session-ID aus Argument oder claude-session://... URI ziehen.
+
+    Jede Sackgasse bekommt ihre eigene Meldung: sonst landen ein leeres
+    Argument, ein URI ohne Wert und ein versehentlich übergebener Pfad alle
+    drei bei "no session id given" und sind nicht unterscheidbar.
+    """
+    roh = arg
+    arg = arg.strip()
+    if "://" in arg:
+        u = urlparse(arg)
+        # Bei 'schema://wert' landet der Wert im netloc, bei 'schema:///wert'
+        # im path — beide Formen akzeptieren.
+        arg = unquote(u.netloc or u.path).strip("/")
+        if not arg:
+            die("this URI contains no session id:\n\n    %s" % roh, rc=2)
+    sid = arg.split("/")[0]
+    if not sid and arg:
+        # z.B. '/home/user/…' — sieht nach einem Pfad aus, nicht nach einer ID
+        die("that is a path, not a session id:\n\n    %s" % roh, rc=2)
+    return sid
+
+
+HINT = "\n\nThe overview lists the available sessions:  claude-sessions"
+
+
+def find(sid):
+    if not sid:
+        die("no session id given" + HINT, rc=2)
+    hits = [p for p in glob.glob(os.path.join(ROOT, "*", "*.jsonl"))
+            if os.path.basename(p)[:-6].startswith(sid)]
+    if not hits:
+        die("no session starts with '%s'" % sid + HINT, rc=2)
+    if len(hits) > 1:
+        die("'%s' is ambiguous (%d sessions) — please give more characters"
+            % (sid, len(hits)), rc=2)
+    return hits[0]
+
+
+def session_cwd(path):
+    """Startverzeichnis der Session; nur die erste Zeile mit 'cwd' parsen.
+
+    Gibt den Pfad auch dann zurück, wenn es ihn nicht mehr gibt — der
+    Aufrufer muss das prüfen und darf NICHT ersatzweise im Home starten:
+    `claude --resume` sucht die Session im Projektverzeichnis, das zum
+    aktuellen cwd gehört, und findet sie von woanders aus schlicht nicht.
+    """
+    try:
+        with open(path, "rb") as fh:
+            for line in fh:
+                if b'"cwd":"' in line:
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except ValueError:
+                        continue
+                    if cwd:
+                        return cwd
+    except FileNotFoundError:
+        # Zwischen der Auflistung in find() und diesem Lesen gelöscht.
+        # Ohne eigenen Zweig käme hier "no working directory" heraus — eine
+        # Meldung über eine Datei, die es gar nicht mehr gibt.
+        die("the session file is gone:\n\n    %s" % path)
+    except OSError as exc:
+        die("cannot read the session file:\n\n    %s\n\n%s" % (path, exc))
+    return None
+
+
+def terminal_cmd(inner):
+    """Ein neues Fenster für 'inner' (Liste) aufmachen.
+
+    Die Reihenfolge in TERMINALS ist eine Vorliebe, keine Bedingung: der
+    erste vorhandene Emulator gewinnt. Die meisten nehmen hinter '-e' die
+    Argumentliste, xfce4-terminal dagegen eine einzige Kommandozeile —
+    deshalb dort die zitierte Fassung.
+
+    Rückgabe None, wenn keiner der Kandidaten im PATH liegt; der Aufrufer
+    muss das melden.
+    """
+    quoted = " ".join(shlex.quote(a) for a in inner)
+    for term in TERMINALS:
+        if not shutil.which(term):
+            continue
+        opt = _TERMINAL_ARGS.get(term)
+        return [term, opt, quoted] if opt else [term, "-e"] + list(inner)
+    return None
+
+
+#: Speichergrenzen für das geöffnete Fenster — dieselben wie in der
+#: Übersicht (claude_sessions/actions.py) und in claude-session@.service.
+#: Am 2026-07-31 wuchsen zwei interaktive Claude-Fenster auf 27,8 bzw.
+#: 28,6 GB und rissen per globalem OOM den ollama-Dienst mit.
+#:
+#: MemoryHigh stand zuerst auf 4G. An den tatsächlich offenen Fenstern
+#: nachgemessen (19:55): 373 MB, 740 MB, 985 MB und 3502 MB — die letzte
+#: seit 5,5 Stunden völlig gesund. 4G hätte sie binnen einer Stunde
+#: ausgebremst; 8G liegt gut über allem Beobachteten.
+MEM_LIMITS = ("--property=MemoryHigh=8G",
+              "--property=MemoryMax=12G",
+              "--property=MemorySwapMax=2G")
+
+
+def spawn(cmd, cwd, env, beschreibung):
+    """Das Fenster starten und dabei von der cgroup des Aufrufers lösen.
+
+    ``start_new_session=True`` löst nur die Prozessgruppe, **nicht die
+    cgroup** — nachgemessen: ein so gestartetes Kind bleibt in der cgroup
+    seiner Eltern. Dieses Programm ist als Handler für
+    ``claude-session://`` registriert, wird also von irgendeiner fremden
+    Anwendung angestoßen (Editor, Browser, Terminal). Das Fenster landete
+    damit in deren cgroup: es stirbt mit ihr, und es hat **keine
+    Speichergrenze** — die Grenze aus der Übersicht greift nur für den Weg
+    über die App.
+
+    ``systemd-run`` hängt es stattdessen als eigene transiente Unit unter
+    den User-Manager. ``ExitType=cgroup`` ist dabei Pflicht: eine transiente
+    Unit ist ``Type=simple`` und gilt als beendet, sobald ihr Hauptprozess
+    weg ist — der Terminal-Starter beendet sich aber sofort, und systemd
+    risse das Fenster mit.
+
+    Die Umgebung wird ausdrücklich durchgereicht: ``systemd-run --user``
+    erbt sonst die des User-Managers, nicht die des Aufrufers.
+
+    Ohne systemd (kein ``systemd-run`` im PATH, oder kein erreichbarer
+    User-Manager) ist das keine Fehlersituation: dann startet das Fenster
+    direkt. Rückgabe sagt, ob es eine eigene cgroup bekommen hat.
+    """
+    if shutil.which("systemd-run"):
+        setenv = ["--setenv=%s=%s" % (k, v) for k, v in sorted(env.items())
+                  if "\n" not in v and "\0" not in v]
+        try:
+            proc = subprocess.run(
+                ["systemd-run", "--user", "--collect", "--quiet",
+                 "--property=ExitType=cgroup", *MEM_LIMITS,
+                 "--working-directory=" + cwd,
+                 "--description=" + beschreibung, *setenv, "--", *cmd],
+                capture_output=True, timeout=15)
+            if proc.returncode == 0:
+                return True
+            log("systemd-run failed (%s), starting directly: %s"
+                % (proc.returncode,
+                   (proc.stderr or b"").decode("utf-8", "replace").strip()[:120]),
+                level="WARN")
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("systemd-run unusable (%s), starting directly" % exc, level="WARN")
+    else:
+        log("systemd-run not found, starting the window directly", level="WARN")
+    # Reserve: ohne erreichbaren systemd lieber ein Fenster ohne eigene
+    # cgroup als gar keins.
+    try:
+        subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        die("could not start the terminal '%s':\n\n    %s" % (cmd[0], exc))
+    return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        die("usage: claude-session-open <session-id|claude-session://id>", rc=2)
+
+    path = find(session_id(sys.argv[1]))
+    sid = os.path.basename(path)[:-6]
+    cwd = session_cwd(path)
+
+    if not cwd:
+        die("session %s: the transcript records no working directory" % sid[:8])
+    if not os.path.isdir(cwd):
+        die("the working directory of this session no longer exists:\n\n"
+            "    %s\n\n"
+            "Claude only finds a session from its own directory.\n"
+            "Recreate that folder, then the session can be opened again." % cwd)
+
+    claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    if not os.path.exists(claude):
+        die("'claude' not found — is Claude Code installed and in PATH?")
+
+    cmd = terminal_cmd([claude, "--resume", sid])
+    if cmd is None:
+        die("no terminal emulator found. Looked for: %s.\n\n"
+            "Install one of them, or put your own into PATH under one of "
+            "these names." % ", ".join(TERMINALS))
+
+    # Claude-eigene Variablen aus der Umgebung nehmen. Wird der Handler aus
+    # einer laufenden Claude-Session heraus angestoßen, erbt das neue Fenster
+    # sonst CLAUDE_CODE_CHILD_SESSION — und die geöffnete Session schaltet
+    # ihre Transcript-Speicherung ab, ohne dass man es merkt.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION",
+                        "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID",
+                        "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT")}
+
+    eigen = spawn(cmd, cwd, env, "Claude session %s" % sid[:8])
+    log("opened session %s in %s%s"
+        % (sid[:8], cwd, "" if eigen else " (without its own cgroup)"))
+
+
+if __name__ == "__main__":
+    main()

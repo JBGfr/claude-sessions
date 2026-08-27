@@ -1,0 +1,46 @@
+name: Tests
+
+# Die Tests kommen ohne GTK, ohne Netz und ohne echte Subprozesse aus
+# (sie importieren nur claude_sessions.data und claude_sessions.actions),
+# deshalb genügt hier ein nacktes Python ohne PyGObject.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: unittest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Aktuelle Python-Reihe; die Entwicklungskiste laeuft auf 3.14.
+          python-version: '3.14'
+
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+
+      # Die drei mitgelieferten Helfer und die Installationsskripte sind
+      # Shell bzw. Python ohne Testabdeckung durch unittest - mindestens
+      # Syntax und Kompilierbarkeit werden hier gefahren.
+      - name: Helfer-Syntax
+        run: |
+          bash -n bin/claude-sessionctl bin/claude-session-runner
+          sh -n bin/claude-sessions tools/install-desktop.sh tools/publish.sh
+          python3 -m py_compile bin/claude-session-open tools/leak-check.py tools/make_icons.py tools/statusline.py
+
+      - name: Leck-Gate Selbsttest
+        run: python3 tools/leak-check.py --selbsttest
+
+      # Die Units werden nur geprueft, nicht installiert. Ohne User-Instanz
+      # auf dem Runner reicht der System-Modus, %h und Co. sind dort gueltig.
+      - name: systemd-Units
+        run: systemd-analyze verify --man=no --generators=no systemd/claude-session@.service systemd/claude-sessions-app.service

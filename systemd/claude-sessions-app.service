@@ -1,0 +1,53 @@
+[Unit]
+Description=Claude Sessions — Desktop-Uebersicht
+Documentation=https://github.com/JBGfr/claude-sessions
+After=default.target
+
+# Die App startet AUSSCHLIESSLICH auf ausdrueckliche Anweisung: Desktop-Icon,
+# Menue-Eintrag oder 'systemctl --user start claude-sessions-app'.
+# Deshalb bewusst kein Autostart und kein 'systemctl --user enable' - ein
+# Fenster, das von selbst aufgeht, ist ausdruecklich nicht gewollt.
+
+[Service]
+Type=simple
+
+# Ohne erreichbare Anzeige gar nicht erst anlaufen. ExecCondition meldet den
+# Dienst dann als uebersprungen statt als gescheitert - kein Fehlerzustand,
+# keine Neustartschleife.
+# Ausgabe verwerfen: xdotool schreibt die Bildschirmgroesse auf stdout und
+# die landete sonst bei jedem Start als sinnfreie Zeile im Journal.
+# Fehlt xdotool, kann die Anzeige nicht geprueft werden: dann anlaufen lassen
+# (exit 0), statt den Dienst an einem fehlenden Hilfsprogramm scheitern zu
+# lassen. Ein fest verdrahtetes /usr/bin/xdotool waere sonst eine stille
+# Installationshuerde auf fremden Rechnern.
+ExecCondition=/bin/sh -c 'command -v xdotool >/dev/null 2>&1 || exit 0; exec xdotool getdisplaygeometry >/dev/null'
+
+# Kein Repo-Pfad in der Unit: das Installationsskript legt
+# ~/.local/bin/claude-sessions als Symlink auf <repo>/bin/claude-sessions an.
+# So bleibt die Unit maschinenneutral, egal wo das Repo liegt, und der Wrapper
+# findet sein Projektverzeichnis selbst (er loest den Symlink auf).
+ExecStart=%h/.local/bin/claude-sessions
+WorkingDirectory=%h
+
+# Kein automatischer Neustart. Auch nach einem Absturz waere das ein Fenster,
+# das ohne Zutun des Nutzers wieder aufgeht - genau das soll nicht passieren.
+# Die Uebersicht ist ein Werkzeug, das man aufruft, kein Hintergrunddienst,
+# der sich selbst am Leben haelt.
+Restart=no
+
+# Nur den eigenen Prozess beenden, nicht die ganze cgroup.
+#
+# Die App oeffnet auf Wunsch Terminals mit laufenden Claude-Sessions
+# (claude-session-open, Live-Log, Watchdog-Logs). 'start_new_session=True'
+# loest die nur von der Prozessgruppe, NICHT von der cgroup — beim
+# Vorgabewert control-group wuerde also jedes Stoppen oder Neustarten der
+# Uebersicht genau die Sitzungen mit abraeumen, die man aus ihr heraus
+# geoeffnet hat. Vor der Umstellung auf den Dienst haben die ueberlebt.
+KillMode=process
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-sessions-app
+
+# Kein [Install]-Abschnitt: die Unit soll sich gar nicht erst 'enable' lassen,
+# damit sie niemand versehentlich in den Autostart haengt.

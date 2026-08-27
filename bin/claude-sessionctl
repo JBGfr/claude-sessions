@@ -1,0 +1,324 @@
+#!/bin/bash
+# Steuert die dauerhaften Claude-Sessions (systemd-User-Dienste + dtach).
+# Die Hilfe steht in usage() weiter unten — englisch, wie jede Ausgabe dieses
+# Werkzeugs; die Kommentare bleiben Deutsch (Projektkonvention).
+#
+# Eigenständiges Kommandozeilenwerkzeug: seine Meldungen gehören NICHT nach
+# claude_sessions/texte.py, die Tabelle dort gehört der GTK-Oberfläche.
+#
+# Alle Unterbefehle außer new/start/stop/restart/rm sind rein lesend.
+set -uo pipefail
+
+# Bewusst $HOME statt $XDG_CONFIG_HOME/$XDG_STATE_HOME — dieselbe Begründung
+# wie im Runner: der läuft unter systemd und sieht die Variablen einer
+# Login-Shell nicht. Beide müssen denselben Ort ohne Umgebung ausrechnen,
+# sonst legt sessionctl die Konfiguration dorthin, wo der Dienst sie nie sucht.
+CONF_DIR="$HOME/.config/claude-sessions"
+STATE_DIR="$HOME/.local/state/claude-sessions"
+UNIT_TPL="claude-session@"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# Farben nur für ein Terminal. Die Übersicht ruft 'claude-sessionctl stop' auf
+# und zeigt die erste Ausgabezeile in einem Dialog (actions.stop_service) —
+# Steuerzeichen stünden dort als Buchstabensalat im Fenster. NO_COLOR ist die
+# übliche Bremse für alles andere, was die Ausgabe weiterverarbeitet.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    B=$'\033[1m'; D=$'\033[2m'; R=$'\033[0m'
+    GRN=$'\033[38;2;126;201;127m'; ORG=$'\033[38;2;215;119;87m'
+    YEL=$'\033[38;2;223;180;95m'; GRY=$'\033[38;2;148;148;158m'
+else
+    B=""; D=""; R=""; GRN=""; ORG=""; YEL=""; GRY=""
+fi
+
+# Verzeichnisse erst anlegen, wenn wirklich geschrieben wird. Sonst waren
+# --help, list, status und sogar ein Tippfehler im Befehl schreibende
+# Aufrufe (Pruefer 2026-08-21) - und die Doku versprach das Gegenteil.
+ensure_dirs() { mkdir -p "$CONF_DIR" "$STATE_DIR"; }
+
+usage() {
+    cat <<'EOF'
+claude-sessionctl — long-running Claude Code sessions as systemd user services.
+
+  claude-sessionctl new <name> [directory]   create a project and start it
+  claude-sessionctl start|stop|restart <name>
+  claude-sessionctl status [name]            read-only, changes nothing
+  claude-sessionctl attach <name>            connect to the live terminal
+  claude-sessionctl log [name] [-f]          show a log file
+  claude-sessionctl list                     all configured projects
+  claude-sessionctl pid <name>               PID of the running claude process
+  claude-sessionctl rm <name>                remove a service (keeps the logs)
+
+Every subcommand except new/start/stop/restart/rm only reads.
+
+Needs: a systemd user instance, dtach, and the claude CLI.
+Config:  ~/.config/claude-sessions/<name>.conf
+Logs:    ~/.local/state/claude-sessions/
+Unit:    claude-session@<name>.service
+EOF
+}
+
+die() { printf '%sError:%s %s\n' "$ORG" "$R" "$1" >&2; exit "${2:-2}"; }
+unit() { printf '%s%s.service' "$UNIT_TPL" "$1"; }
+sock() { printf '%s/claude-%s.sock' "$RUNTIME" "$1"; }
+
+need_name() { [[ -n "${1:-}" ]] || die "missing name. Existing: $(names | tr '\n' ' ')"; }
+
+# Fehlende Voraussetzungen beim ersten Bedarf benennen. Ohne das endet ein
+# 'attach' ohne dtach in einem blanken "command not found", und ein Dienst,
+# der deswegen nicht anläuft, sieht aus wie ein Fehler dieses Programms.
+need_cmd() {
+    command -v "$1" > /dev/null 2>&1 || die "$1 not found in PATH — $2" 127
+}
+need_dtach() { need_cmd dtach "install it (Debian/Ubuntu: apt install dtach)"; }
+need_systemd() {
+    need_cmd systemctl "these sessions run as systemd user services"
+    # Die Datei allein reicht nicht: in Containern und chroots liegt systemctl
+    # herum, ohne dass ein User-Manager erreichbar waere.
+    systemctl --user show-environment > /dev/null 2>&1 \
+        || die "no systemd user instance reachable (systemctl --user) — these sessions need one" 127
+}
+
+names() {
+    local f
+    for f in "$CONF_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        basename "$f" .conf
+    done
+}
+
+log_event() {
+    printf '%s %-5s [%s] %s\n' "$(date --iso-8601=seconds)" "INFO" \
+        "sessionctl" "$1" >> "$STATE_DIR/events.log"
+}
+
+cmd_new() {
+    ensure_dirs
+    local name="${1:-}" dir="${2:-$PWD}"
+    need_name "$name"
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "name may only contain letters, digits, - and _"
+    need_systemd
+    need_dtach
+    dir="$(cd "$dir" 2>/dev/null && pwd)" || die "no such directory: ${2:-$PWD}"
+    # Der Runner liest die Datei mit 'source' — ein Pfad mit ", $, ` oder \
+    # würde dort als Shell-Code aufgehen statt als Verzeichnis. Lieber hier
+    # klar absagen als später eine Zeile ausführen, die niemand geschrieben hat.
+    case "$dir" in
+        *[\"\$\`\\]*) die "directory name contains \" \$ \` or \\ — not usable in the config file" ;;
+    esac
+    local conf="$CONF_DIR/$name.conf"
+    if [[ -e "$conf" ]]; then
+        printf '%sAlready there:%s %s\n' "$YEL" "$R" "$conf"
+    else
+        cat > "$conf" <<EOF
+# Claude session '$name' — read by claude-session-runner.
+# After changes: claude-sessionctl restart $name
+
+DIR="$dir"
+
+# Leave empty to use the defaults from ~/.claude/settings.json.
+MODEL=""
+EFFORT=""
+
+# Only used for the very first start (later starts resume the conversation).
+PROMPT=""
+
+# 1 = run without permission prompts (--dangerously-skip-permissions).
+# The default is 0: with 1 Claude shows a warning dialog on the first start
+# where "No, exit" is preselected — an absent-minded Enter ends the session
+# right there. Whatever ~/.claude/settings.json sets applies either way;
+# BYPASS=1 only adds the command line switch.
+BYPASS=0
+
+# Extra arguments, appended verbatim.
+EXTRA=""
+EOF
+        printf '%sCreated:%s %s\n' "$GRN" "$R" "$conf"
+    fi
+    log_event "project '$name' created ($dir)"
+    cmd_start "$name"
+}
+
+cmd_start() {
+    ensure_dirs
+    need_name "${1:-}"
+    [[ -r "$CONF_DIR/$1.conf" ]] || die "no project '$1' — create it with: claude-sessionctl new $1"
+    need_systemd
+    need_dtach
+    systemctl --user enable --now "$(unit "$1")" 2>&1 | grep -v "^Created symlink" || true
+    sleep 1
+    log_event "service '$1' started"
+    cmd_status "$1"
+}
+
+cmd_stop() {
+    need_name "${1:-}"
+    need_systemd
+    systemctl --user disable --now "$(unit "$1")" 2>&1 | grep -v "^Removed" || true
+    log_event "service '$1' stopped"
+    printf '%sStopped:%s %s\n' "$YEL" "$R" "$1"
+}
+
+cmd_restart() {
+    ensure_dirs
+    need_name "${1:-}"
+    [[ -r "$CONF_DIR/$1.conf" ]] || die "no project '$1' — create it with: claude-sessionctl new $1"
+    need_systemd
+    need_dtach
+    # 'stop' deaktiviert die Unit (disable --now). Ein 'restart' danach würde
+    # sie zwar wieder starten, aber deaktiviert lassen: sie läuft, kommt nach
+    # dem nächsten Systemstart aber nicht wieder — und niemand merkt es, weil
+    # 'status' sie als aktiv zeigt. Der ganze Zweck dieser Dienste ist aber,
+    # einen Neustart zu überleben. Deshalb hier dasselbe sicherstellen wie bei
+    # 'start'.
+    systemctl --user enable "$(unit "$1")" > /dev/null 2>&1
+    systemctl --user restart "$(unit "$1")"
+    log_event "service '$1' restarted"
+    sleep 1
+    cmd_status "$1"
+}
+
+cmd_rm() {
+    ensure_dirs
+    need_name "${1:-}"
+    # Nur entfernen, was hier auch angelegt wurde. Ohne diese Prüfung löscht
+    # 'rm <beliebiger-name>' blind $RUNTIME/claude-<name>.sock — und in diesem
+    # Verzeichnis liegen auch fremde Sockets: die Claude-Desktop-App hält dort
+    # z. B. claude-cowork-vm.sock. Ein Vertipper hätte also ein anderes
+    # Programm lahmgelegt und obendrein "Removed" für ein Projekt gemeldet,
+    # das es nie gab.
+    [[ -e "$CONF_DIR/$1.conf" ]] || \
+        die "no project named '$1'. Existing: $(names | tr '\n' ' ')"
+    need_systemd
+    systemctl --user disable --now "$(unit "$1")" > /dev/null 2>&1
+    # Der Socket überlebt das Stoppen des Dienstes; ohne dieses Aufräumen
+    # bleibt eine tote Datei liegen, die später wie eine laufende Session
+    # aussieht.
+    rm -f "$(sock "$1")"
+    rm -f "$CONF_DIR/$1.conf"
+    log_event "project '$1' removed"
+    printf '%sRemoved:%s %s (logs stay in %s)\n' "$YEL" "$R" "$1" "$STATE_DIR"
+}
+
+# Laufzeit eines Dienstes in lesbarer Form.
+uptime_of() {
+    local ts
+    ts=$(systemctl --user show -p ActiveEnterTimestamp --value "$(unit "$1")" 2>/dev/null)
+    [[ -z "$ts" || "$ts" == "n/a" ]] && { printf '—'; return; }
+    local start now d
+    start=$(date -d "$ts" +%s 2>/dev/null) || { printf '—'; return; }
+    now=$(date +%s); d=$(( now - start ))
+    if   (( d < 60 ));    then printf '%ds' "$d"
+    elif (( d < 3600 ));  then printf '%dm' $(( d / 60 ))
+    elif (( d < 86400 )); then printf '%dh %dm' $(( d / 3600 )) $(( d % 3600 / 60 ))
+    else printf '%dd %dh' $(( d / 86400 )) $(( d % 86400 / 3600 )); fi
+}
+
+# PID des echten Claude-Prozesses einer Unit.
+# Nicht über 'pgrep -P <MainPID>': claude ist ein Enkel (dtach -> bash ->
+# claude). Die cgroup der Unit listet dagegen genau ihre Prozesse.
+claude_pid() {
+    local cg p
+    cg=$(systemctl --user show -p ControlGroup --value "$(unit "$1")" 2>/dev/null)
+    [[ -n "$cg" && -r "/sys/fs/cgroup$cg/cgroup.procs" ]] || return 1
+    while read -r p; do
+        [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == "claude" ]] && { printf '%s' "$p"; return 0; }
+    done < "/sys/fs/cgroup$cg/cgroup.procs"
+    return 1
+}
+
+status_one() {
+    local name="$1" act sub pid dir tail_n="${2:-0}"
+    act=$(systemctl --user is-active "$(unit "$name")" 2>/dev/null)
+    sub=$(systemctl --user show -p SubState --value "$(unit "$name")" 2>/dev/null)
+    pid=$(systemctl --user show -p MainPID --value "$(unit "$name")" 2>/dev/null)
+    dir=$(sed -n 's/^DIR="\(.*\)"$/\1/p' "$CONF_DIR/$name.conf" 2>/dev/null)
+    [[ "$dir" == "$HOME"* ]] && dir="~${dir#"$HOME"}"
+
+    local dot col
+    case "$act" in
+        active)      dot="●"; col="$GRN" ;;
+        failed)      dot="●"; col="$ORG" ;;
+        activating)  dot="◐"; col="$YEL" ;;
+        *)           dot="○"; col="$GRY" ;;
+    esac
+
+    local cpid=""
+    [[ "$act" == "active" ]] && cpid=$(claude_pid "$name" 2>/dev/null)
+
+    printf '%s%s %-16s%s %s%-10s%s  %-9s  PID %-8s  %s\n' \
+        "$col" "$dot" "$name" "$R" "$D" "${act:-unknown}" "$R" \
+        "$(uptime_of "$name")" "${cpid:-${pid:-—}}" "$dir"
+
+    [[ -S "$(sock "$name")" ]] || printf '   %sno dtach socket — cannot attach%s\n' "$GRY" "$R"
+
+    if (( tail_n > 0 )) && [[ -r "$STATE_DIR/$name.log" ]]; then
+        tail -n "$tail_n" "$STATE_DIR/$name.log" | sed "s/^/   ${D}/;s/\$/${R}/"
+    fi
+}
+
+cmd_status() {
+    local one="${1:-}"
+    need_systemd
+    printf '\n%s  Claude sessions%s  %s(systemd --user, dtach)%s\n\n' "$B" "$R" "$D" "$R"
+    if [[ -n "$one" ]]; then
+        [[ -r "$CONF_DIR/$one.conf" ]] || die "no project '$one'"
+        status_one "$one" 8
+    else
+        local any=0 n
+        while read -r n; do
+            [[ -n "$n" ]] || continue
+            any=1; status_one "$n" 3
+        done < <(names)
+        (( any )) || printf '   %sno project yet — claude-sessionctl new <name> [directory]%s\n' "$GRY" "$R"
+    fi
+    printf '\n   %sattach: claude-sessionctl attach <name>   (detach with Ctrl+\\)%s\n\n' "$D" "$R"
+}
+
+cmd_attach() {
+    need_name "${1:-}"
+    need_dtach
+    local s; s="$(sock "$1")"
+    [[ -S "$s" ]] || die "no live terminal for '$1'. Status: claude-sessionctl status $1"
+    printf '%sAttaching to '\''%s'\''. Detach with Ctrl+\\ — the session keeps running.%s\n' \
+        "$D" "$1" "$R"
+    # KEIN sleep hier: während einer Wartezeit landen Tastendrücke noch in der
+    # Shell statt in der Session. Wer sofort Enter drückt — etwa um eine
+    # wartende Rückfrage zu bestätigen — verliert den Anschlag sonst ersatzlos,
+    # und die Session hängt weiter am Dialog.
+    # -r winch: Größe beim Verbinden neu aushandeln, sonst bleibt die TUI auf
+    # der Größe des Fensters stehen, in dem sie gestartet wurde.
+    exec dtach -a "$s" -r winch
+}
+
+cmd_log() {
+    local name="${1:-}" follow=""
+    [[ "${1:-}" == "-f" ]] && { follow="-f"; name=""; }
+    [[ "${2:-}" == "-f" ]] && follow="-f"
+    local f="$STATE_DIR/events.log"
+    [[ -n "$name" ]] && f="$STATE_DIR/$name.log"
+    [[ -r "$f" ]] || die "no log at $f"
+    printf '%s%s%s\n' "$D" "$f" "$R"
+    # shellcheck disable=SC2086
+    tail -n 40 $follow "$f"
+}
+
+cmd_list() {
+    local n
+    while read -r n; do [[ -n "$n" ]] && printf '%s\n' "$n"; done < <(names)
+}
+
+case "${1:-status}" in
+    new)      shift; cmd_new "$@" ;;
+    start)    shift; cmd_start "${1:-}" ;;
+    stop)     shift; cmd_stop "${1:-}" ;;
+    restart)  shift; cmd_restart "${1:-}" ;;
+    rm)       shift; cmd_rm "${1:-}" ;;
+    status)   shift; cmd_status "${1:-}" ;;
+    attach)   shift; cmd_attach "${1:-}" ;;
+    log|logs) shift; cmd_log "${1:-}" "${2:-}" ;;
+    list)     cmd_list ;;
+    pid)      shift; need_name "${1:-}"; need_systemd
+              claude_pid "$1" || die "no running claude process for '$1'" 1 ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $1 — help: claude-sessionctl --help" ;;
+esac

@@ -1,0 +1,75 @@
+#!/bin/sh
+# Startet die Session-Uebersicht. Kein Paket, keine Installation:
+# PYTHONPATH zeigt auf das Projektverzeichnis (wie beim Watchdog).
+#
+# Das Projektverzeichnis wird aus dem Ort DIESER Datei abgeleitet, nicht aus
+# einem festen Pfad — das Repo darf also liegen, wo der Nutzer es haben will.
+# Dabei muessen Symlinks aufgeloest werden: ausgeliefert wird das Programm als
+# '~/.local/bin/claude-sessions' -> '<repo>/bin/claude-sessions', und ein
+# '..' vom Symlink aus zeigte sonst auf '~/.local' statt auf das Repo.
+
+# Aufruf ohne Pfadangabe (ueber PATH): den tatsaechlichen Ort nachschlagen.
+self="$0"
+case "$self" in
+    */*) : ;;
+    *) self="$(command -v -- "$self" 2>/dev/null || printf '%s' "$self")" ;;
+esac
+
+verzeichnis="$(dirname -- "$self")"
+name="$(basename -- "$self")"
+# Symlink-Kette Glied fuer Glied aufloesen. Die Obergrenze bricht Ringe auf,
+# statt endlos zu laufen.
+schritt=0
+while [ -L "$verzeichnis/$name" ] && [ "$schritt" -lt 40 ]; do
+    schritt=$((schritt + 1))
+    ziel="$(readlink -- "$verzeichnis/$name")"
+    case "$ziel" in
+        /*) verzeichnis="$(dirname -- "$ziel")" ;;
+        # Relative Ziele gelten ab dem Verzeichnis des Symlinks.
+        *) verzeichnis="$(cd -- "$verzeichnis" && cd -- "$(dirname -- "$ziel")" && pwd)" ;;
+    esac
+    name="$(basename -- "$ziel")"
+done
+
+DIR="$(cd -- "$verzeichnis/.." && pwd)"
+
+# python3 aus dem PATH, /usr/bin/python3 nur als Rueckfall: auf Systemen, die
+# python3 woanders ablegen, brach der feste Pfad mit 127.
+PY="$(command -v python3 2>/dev/null || echo /usr/bin/python3)"
+
+# --service: den Weg ueber systemd nehmen, damit es genau EINEN Einstieg gibt.
+#
+# Ohne das laesst sich die App am Dienst vorbei starten. Weil sie eine
+# Gtk.Application mit fester ID ist, endet ein zweiter Start sofort mit 0 —
+# ein spaeteres 'systemctl start' meldet dann "Started" und unmittelbar
+# darauf "Deactivated successfully", waehrend das Fenster sichtbar offen
+# steht. Der Dienst gilt als beendet und Restart=on-failure kann nie
+# greifen: die Ueberwachung waere still ausgeschaltet.
+#
+# Laeuft der Dienst schon, holt der Zweitstart ueber die Single-Instance-
+# Logik nur das vorhandene Fenster nach vorn.
+if [ "${1:-}" = "--service" ]; then
+    shift
+    if command -v systemctl > /dev/null 2>&1 &&
+       systemctl --user cat claude-sessions-app.service > /dev/null 2>&1; then
+        if systemctl --user is-active --quiet claude-sessions-app.service; then
+            # Laeuft schon: das vorhandene Fenster nach vorn holen, statt einen
+            # zweiten Prozess zu starten. Der wuerde per Single-Instance nur
+            # durchreichen und sich sofort mit 0 beenden - und weil systemd
+            # denselben Unit-Namen sieht, stand die Unit danach auf "inactive",
+            # obwohl das Fenster offen war. Genau diese Verwirrung ist am
+            # 2026-08-18 mehrfach als "App beendet sich von selbst" erschienen.
+            if command -v gdbus > /dev/null 2>&1; then
+                exec gdbus call --session \
+                    --dest de.jbgfr.ClaudeSessions \
+                    --object-path /de/jbgfr/ClaudeSessions \
+                    --method org.gtk.Application.Activate "{}"
+            fi
+            exec env PYTHONPATH="$DIR" "$PY" -m claude_sessions.app "$@"
+        fi
+        exec systemctl --user start claude-sessions-app.service
+    fi
+    # Ohne installierte Unit ganz normal starten.
+fi
+
+PYTHONPATH="$DIR" exec "$PY" -m claude_sessions.app "$@"

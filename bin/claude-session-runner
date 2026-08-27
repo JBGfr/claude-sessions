@@ -1,0 +1,167 @@
+#!/bin/bash
+# Startet EINE Claude-Code-Session unter dtach — aufgerufen vom systemd-Dienst
+# claude-session@<name>.service, nicht von Hand.
+#
+# Warum dtach -N und nicht -n:
+#   -n startet losgelöst und kehrt SOFORT zurück. Unter systemd (Type=simple)
+#   gilt der Dienst damit als beendet; eine Restart-Regel würde in einer
+#   Endlosschleife immer neue Claude-Prozesse starten und dabei Tokens
+#   verbrennen. -N legt denselben Socket an, bleibt aber im Vordergrund:
+#   systemd hat einen echten Prozess zu überwachen, und 'dtach -a' kann sich
+#   jederzeit dazuschalten.
+#
+# Eigenständiges Kommandozeilenwerkzeug: seine Meldungen stehen hier und nicht
+# in claude_sessions/texte.py — die Tabelle dort gehört der GTK-Oberfläche.
+# Grundsprache ist wie im übrigen Repo Englisch, Kommentare bleiben Deutsch.
+set -uo pipefail
+
+if [[ -z "${1:-}" ]]; then
+    printf 'usage: claude-session-runner <name>\n' >&2
+    printf '       (started by claude-session@<name>.service, not by hand)\n' >&2
+    # 78 = EX_CONFIG. Die Unit führt 78 in RestartPreventExitStatus, ein Start
+    # ohne Namen läuft deshalb nicht in eine Neustartschleife.
+    exit 78
+fi
+NAME="$1"
+
+# Bewusst $HOME statt $XDG_CONFIG_HOME/$XDG_STATE_HOME: dieses Skript läuft
+# unter systemd, claude-sessionctl dagegen in einer Login-Shell. Wer die
+# XDG-Variablen nur in seiner Shell setzt, hätte zwei verschiedene Orte — der
+# Dienst suchte die Konfiguration dann dort, wo sessionctl sie nie hingelegt
+# hat, und stürbe mit "configuration missing". Beide Werkzeuge müssen denselben
+# Ort ohne Umgebung ausrechnen können; die Unit nennt ihn in Documentation=.
+CONF_DIR="$HOME/.config/claude-sessions"
+CONF="$CONF_DIR/$NAME.conf"
+STATE_DIR="$HOME/.local/state/claude-sessions"
+LOG="$STATE_DIR/$NAME.log"
+EVENTS="$STATE_DIR/events.log"
+SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/claude-$NAME.sock"
+
+mkdir -p "$STATE_DIR"
+
+ts() { date --iso-8601=seconds; }
+say() {  # Ereignis in beide Logs: Projektlog und gemeinsames Ereignislog
+    printf '%s %-5s [%s] %s\n' "$(ts)" "${2:-INFO}" "$NAME" "$1" | tee -a "$EVENTS" >> "$LOG"
+}
+
+if [[ ! -r "$CONF" ]]; then
+    say "configuration missing: $CONF" ERROR
+    exit 78          # EX_CONFIG — Bedienfehler, kein Neustart sinnvoll
+fi
+
+# Konfiguration: DIR ist Pflicht, der Rest hat Vorgaben.
+# BYPASS bewusst 0: fehlt der Wert in der Projektdatei, läuft die Session MIT
+# Berechtigungsrückfragen. Eine Vorgabe von 1 würde eine von Hand gekürzte
+# Konfiguration stillschweigend mit --dangerously-skip-permissions starten.
+DIR=""; MODEL=""; EFFORT=""; PROMPT=""; BYPASS=0; EXTRA=""
+# shellcheck source=/dev/null
+source "$CONF"
+
+if [[ -z "$DIR" || ! -d "$DIR" ]]; then
+    say "working directory missing or gone: '${DIR:-<empty>}'" ERROR
+    exit 78
+fi
+
+# dtach ist echte Voraussetzung, nicht Beiwerk: ohne es gibt es kein Terminal
+# zum Anhängen. Die Meldung muss das sagen — ein blankes "command not found"
+# im Journal beantwortet die Frage nicht, warum der Dienst nicht anläuft.
+if ! command -v dtach > /dev/null 2>&1; then
+    say "dtach not found in PATH — install it (Debian/Ubuntu: apt install dtach)" ERROR
+    exit 127         # steht in RestartPreventExitStatus: kein Neustart im Kreis
+fi
+
+CLAUDE="$HOME/.local/bin/claude"
+[[ -x "$CLAUDE" ]] || CLAUDE="$(command -v claude || true)"
+if [[ -z "$CLAUDE" ]]; then
+    say "claude CLI not found (looked in ~/.local/bin and PATH)" ERROR
+    exit 127
+fi
+
+# Bypass ist unter root gesperrt (Meldung steckt wörtlich im Binary).
+if [[ "$(id -u)" == "0" ]]; then
+    say "running as root — bypass is blocked there, run the service as a normal user" ERROR
+    exit 77          # EX_NOPERM
+fi
+
+# Alte Socket-Leiche entfernen: nach einem Absturz bleibt die Datei liegen und
+# dtach -N würde mit "socket exists" abbrechen.
+if [[ -S "$SOCK" ]] && ! dtach -p "$SOCK" < /dev/null > /dev/null 2>&1; then
+    say "removed stale socket: $SOCK"
+    rm -f "$SOCK"
+fi
+
+# Beim ersten Start gibt es nichts fortzusetzen: '--continue' scheitert dann
+# ("No conversation found") und würde einen Neustart-Zyklus auslösen.
+#
+# Claude legt die Transkripte unter <Konfigverzeichnis>/projects/<Schlüssel> ab.
+# Der Schlüssel ist der Arbeitspfad, in dem JEDES Zeichen außer A-Z, a-z und 0-9
+# durch '-' ersetzt ist — im CLI wörtlich path.replace(/[^a-zA-Z0-9]/g, "-")
+# (nachgesehen in der ausgelieferten Fassung 2.1.238). Eine Fassung, die nur '/'
+# ersetzt, trifft jeden Pfad mit Punkt, Leerzeichen oder Umlaut daneben:
+# '~/my.project' liegt unter '-home-user-my-project', gesucht würde
+# '-home-user-my.project'. Das endet nicht in einem Fehler, sondern in etwas
+# Teurerem — '--continue' entfiele, und der Dienst begänne bei jedem Neustart
+# eine neue Sitzung.
+#
+# Die Zeichenliste steht ausgeschrieben statt als Bereich 'A-Z': in einem
+# Muster richten sich Bereiche nach der Sortierordnung der Umgebung, in der
+# manche Locale auch 'ä' zwischen 'a' und 'b' einsortiert.
+_ALNUM='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+PROJ_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+PROJ_KEY="${DIR//[^$_ALNUM]/-}"
+
+hat_transkript() {
+    compgen -G "$PROJ_ROOT/$1/*.jsonl" > /dev/null 2>&1 && return 0
+    # Über 200 Zeichen kürzt Claude den Schlüssel und hängt einen Hash an.
+    if (( ${#1} > 200 )); then
+        compgen -G "$PROJ_ROOT/${1:0:200}-*/*.jsonl" > /dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+ARGS=()
+if hat_transkript "$PROJ_KEY"; then
+    ARGS+=(--continue)
+    MODE="resumed"
+else
+    MODE="new"
+    [[ -n "$PROMPT" ]] && ARGS+=("$PROMPT")
+fi
+[[ -n "$MODEL"  ]] && ARGS+=(--model "$MODEL")
+[[ -n "$EFFORT" ]] && ARGS+=(--effort "$EFFORT")
+[[ "$BYPASS" == "1" ]] && ARGS+=(--dangerously-skip-permissions)
+# shellcheck disable=SC2206
+[[ -n "$EXTRA" ]] && ARGS+=($EXTRA)
+
+say "start ($MODE) in $DIR — socket $SOCK"
+
+cd "$DIR" || { say "cannot change into $DIR" ERROR; exit 78; }
+
+# Die TUI braucht einen Terminaltyp; unter systemd ist keiner gesetzt.
+export TERM="${TERM:-xterm-256color}"
+# Geerbte Claude-Variablen würden die Transkript-Speicherung abschalten.
+unset CLAUDECODE CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID \
+      CLAUDE_PID CLAUDE_CODE_ENTRYPOINT CLAUDE_EFFORT
+
+# 'dtach -N' endet IMMER mit 1 — der Exit-Code des Kommandos geht dabei
+# verloren (gemessen: 'exit 0' und 'exit 7' liefern beide 1). Würde der Dienst
+# das übernehmen, sähe jedes saubere '/exit' wie ein Absturz aus und
+# Restart=on-failure startete eine neue Session — samt Tokenkosten. Deshalb
+# schreibt das innere Kommando seinen echten Status in eine Datei, die der
+# Runner danach als eigenen Exit-Code weiterreicht.
+RC_FILE="$(mktemp -t "claude-$NAME-rc.XXXXXX")"
+trap 'rm -f "$RC_FILE"' EXIT
+
+dtach -N "$SOCK" bash -c 'rc_file="$1"; shift; "$@"; printf %s "$?" > "$rc_file"' \
+      _ "$RC_FILE" "$CLAUDE" "${ARGS[@]}"
+
+# Keine Statusdatei = dtach selbst ist gescheitert (etwa belegter Socket).
+RC="$(cat "$RC_FILE" 2>/dev/null)"
+[[ "$RC" =~ ^[0-9]+$ ]] || RC=1
+
+if [[ "$RC" == "0" ]]; then
+    say "exited cleanly (code 0) — no restart"
+else
+    say "exited with code $RC — systemd restarts it" WARN
+fi
+exit "$RC"

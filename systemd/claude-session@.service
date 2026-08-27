@@ -1,0 +1,100 @@
+[Unit]
+Description=Claude Code session: %i
+Documentation=file:%h/.config/claude-sessions/%i.conf
+After=default.target
+
+# Bremse gegen Dauerschleifen, etwa wenn ein Nutzungslimit erreicht ist:
+# nach 5 Fehlstarts in 10 Minuten bleibt der Dienst auf 'failed' stehen.
+# Gehört nach [Unit] — in [Service] wird der Schlüssel ignoriert.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Fester, maschinenneutraler Pfad: den Symlink legt tools/install-desktop.sh
+# an (er zeigt auf bin/claude-session-runner im Repo). Ein Pfad ins
+# Projektverzeichnis stünde hier fest verdrahtet und wäre bei jedem anderen
+# Ablageort falsch.
+ExecStart=%h/.local/bin/claude-session-runner %i
+WorkingDirectory=%h
+
+# Der lokale, token-freie Watchdog: systemd merkt, dass der Prozess weg ist,
+# und startet ihn neu. Dafür läuft kein einziger API-Aufruf.
+#
+# Bewusst 'on-failure' statt 'always': beendet sich Claude sauber (Aufgabe
+# fertig, /exit), ist das kein Absturz. 'always' würde dann sofort eine neue
+# Session starten und mit --continue den kompletten Verlauf neu einlesen —
+# also Tokens verbrennen, ohne dass jemand etwas beauftragt hat.
+Restart=on-failure
+RestartSec=10
+
+# Konfigurationsfehler (78), fehlende Rechte (77) und fehlende Programme (127)
+# sind durch Neustarten nicht zu heilen — der Dienst bleibt dann liegen, statt
+# im Kreis zu laufen.
+RestartPreventExitStatus=77 78 127
+
+# Keine Eingabe von außen; Ausgabe geht ins Journal. Das Terminal der Session
+# selbst hängt am dtach-Socket, nicht an diesen Kanälen.
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-%i
+
+# Beim Stoppen die ganze Prozessgruppe mitnehmen (dtach + claude).
+#
+# Ausdrücklich 'control-group' und nicht 'mixed': 'mixed' schickt SIGTERM nur
+# an den HAUPTprozess, und das ist hier der Runner — nicht Claude. Der Runner
+# ist ein Shell-Skript, das dtach im Vordergrund laufen lässt; ein untraptes
+# SIGTERM beendet ihn sofort, und systemd räumt den Rest der cgroup unmittelbar
+# per SIGKILL ab. Claude bekam damit nie ein SIGTERM und nie eine Gelegenheit,
+# sauber herunterzufahren; TimeoutStopSec lief gar nicht erst an.
+#
+# Gemessen am 2026-07-31 an einer laufenden Sitzung: 'Stopping' um
+# 15:43:00.827976, erstes SIGKILL um 15:43:00.829235 — 1,3 Millisekunden
+# Gnadenfrist. Mit einem Nachbau der Runner-Struktur nachgestellt:
+#
+#   KillMode=mixed          Kind sieht KEIN SIGTERM;  dtach-Socket bleibt
+#                           verwaist liegen
+#   KillMode=control-group  Kind bekommt SIGTERM und räumt auf; Socket wird
+#                           sauber entfernt
+#
+# Die verwaisten Sockets standen dreimal im Ereignislog ('removed stale
+# socket' beim nächsten Start). 'control-group' schickt SIGTERM an alle
+# Prozesse der cgroup und greift erst nach TimeoutStopSec zu SIGKILL.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Speichergrenzen, damit eine durchgehende Sitzung nicht den ganzen Rechner
+# mitnimmt. Am 2026-07-31 wuchsen zwei interaktive Claude-Fenster auf 27,8
+# bzw. 28,6 GB (dazu 25,8 GB Swap); der Kernel räumte daraufhin global auf und
+# erschlug einen anderen Dienst. Hier läuft dasselbe Programm — die Sitzungen
+# dieser Unit kamen in sieben Tagen zwar nur auf 606 MB bis 1,1 GB, aber genau
+# darum tut eine Grenze weit darüber auch niemandem weh.
+#
+# MemoryHigh bremst nur (Reclaim-Druck) und tötet nichts. MemorySwapMax
+# verhindert den Swap-Sturm, der den Rechner unbedienbar macht.
+#
+# MemoryHigh stand zuerst auf 4G — zu eng, und die Begründung stammte aus der
+# falschen Ecke: die 1,1 GB gelten für Sitzungen dieser Unit, die meist untätig
+# auf jemanden warten. An den tatsächlich benutzten Fenstern nachgemessen am
+# 2026-07-31 um 19:55: 373 MB, 740 MB, 985 MB und 3502 MB. Die letzte lief seit
+# 5,5 Stunden völlig gesund und wäre binnen einer Stunde in die Bremse
+# gelaufen. 8G liegt gut über allem Beobachteten und weiterhin weit unter dem
+# Ausreißer.
+#
+# MemoryMax ist bewusst abgewogen: greift sie, wird die Sitzung erschlagen und
+# wegen Restart=on-failure mit '--continue' neu gestartet — das kostet einmal
+# Tokens für das erneute Einlesen. Eine Sitzung, die auf 12 GB gewachsen ist,
+# ist aber ohnehin defekt, und ein eingegrenzter Neustart ist deutlich billiger
+# als ein eingefrorener Rechner. StartLimitBurst oben verhindert, dass daraus
+# eine Schleife wird.
+MemoryHigh=8G
+MemoryMax=12G
+MemorySwapMax=2G
+
+Environment=TERM=xterm-256color
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

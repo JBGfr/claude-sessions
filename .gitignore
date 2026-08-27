@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Arbeitsnotiz für den Obsidian-Vault, nicht Teil der Veröffentlichung.
+projekt-claude-sessions.md
+
+# Lokale Claude-Code-Einstellungen (Berechtigungen dieser Kiste).
+.claude/
