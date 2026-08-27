@@ -8,6 +8,11 @@ the [Claude Watchdog](https://github.com/JBGfr/claude-watchdog) if that is
 installed, and the current plan usage. Everything it displays it reads from
 local files and from the Claude Code CLI; it opens no network connection.
 
+![The overview in demo mode](assets/screenshot.png)
+
+*The screenshot runs in demo mode (`CS_DEMO=1`), so it shows invented sessions
+instead of real titles and paths — see [Screenshots](#screenshots).*
+
 The user interface, the source comments and the commit messages are German.
 This README is the English one; `README.de.md` is the German version.
 
@@ -433,6 +438,21 @@ falls back: `"Anthropic Sans", Inter, "Noto Sans", Cantarell, sans-serif` for
 the interface, `"Anthropic Serif", Georgia, serif` for the greeting. Whoever
 has those fonts installed sees the same typography as the original; everyone
 else sees the same colours and the same grid, set in the system font.
+
+## Screenshots
+
+The window shows session titles and project paths, so a screenshot of a real
+run publishes exactly those. Every picture in this repository therefore comes
+from demo mode, which replaces the snapshot with invented sessions:
+
+```sh
+CS_DEMO=1 bin/claude-sessions
+```
+
+The data lives in `claude_sessions/demo.py`; `tests/test_demo.py` keeps it
+honest — the counters have to match the list, no `/home/` path may appear, and
+two runs have to produce the same picture. Never commit a screenshot taken
+from a real session.
 
 ## What it puts on screen
 

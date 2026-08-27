@@ -9,6 +9,11 @@ ausschliesslich lokale Dateien und die Claude-Code-CLI und öffnet keine
 Netzverbindung. Als App-Icon dient das Block-Art-Maskottchen aus dem
 Claude-Code-Terminal-Header, pixelgenau dekodiert (`tools/make_icons.py`).
 
+![Die Übersicht im Demo-Modus](assets/screenshot.png)
+
+*Das Bild entsteht im Demo-Modus (`CS_DEMO=1`) und zeigt erfundene Sitzungen
+statt echter Titel und Pfade — siehe [Screenshots](#screenshots).*
+
 ## Was sie zeigt
 
 | Abschnitt | Quelle | Inhalt |
@@ -420,6 +425,21 @@ diesem Repo. Die CSS-Kette nennt sie zuerst und fällt dann zurück:
 Oberfläche, `"Anthropic Serif", Georgia, serif` für die Begrüßung. Wer die
 Schriften installiert hat, sieht dieselbe Typografie wie im Vorbild; alle
 anderen sehen dieselben Farben und dasselbe Raster in der Systemschrift.
+
+## Screenshots
+
+Das Fenster zeigt Sitzungstitel und Projektpfade — ein Bild aus dem Echtbetrieb
+veröffentlicht also genau diese. Jedes Bild in diesem Repo entsteht deshalb im
+Demo-Modus, der den Schnappschuss durch erfundene Sitzungen ersetzt:
+
+```sh
+CS_DEMO=1 bin/claude-sessions
+```
+
+Die Daten stehen in `claude_sessions/demo.py`; `tests/test_demo.py` hält sie
+ehrlich: die Zähler müssen zur Liste passen, kein `/home/`-Pfad darf auftauchen,
+und zwei Läufe müssen dasselbe Bild ergeben. Nie ein Bild aus einer echten
+Sitzung einchecken.
 
 ## Was auf dem Bildschirm steht
 

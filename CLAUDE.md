@@ -132,6 +132,19 @@ Wer eine dieser Stellen ändert, streicht die Begründung mit oder schreibt die
 neue Messung daneben — eine Änderung ohne Gegenmessung ist hier schon einmal
 teuer geworden.
 
+## Die Helfer gehören hierher
+
+`bin/claude-session-open`, `bin/claude-sessionctl`, `bin/claude-session-runner` und
+`systemd/claude-session@.service` sind seit dem 2026-08-27 die **maßgebliche** Fassung. Das
+private `zsh-menu` hält nur noch relative Verweise hierher; `~/.local/bin` löst über diese
+Kette auf. Änderungen also hier machen — eine zweite Kopie drüben würde auseinanderlaufen,
+und die produktiven `claude-session@`-Dienste dieser Maschine hängen an genau diesen Dateien.
+
+Zwei Entscheidungen darin sind teuer erkauft und bleiben: `dtach -N` (nicht `-n`, sonst hält
+systemd den Dienst für beendet und startet in einer Schleife neu) und `Restart=on-failure`.
+Der Transkript-Pfad kodiert **jedes** Nicht-Alphanumerische zu `-`, nicht nur `/` — sonst
+bekommt jeder Projektpfad mit Punkt nie ein `--continue`.
+
 ## Screenshots: nur aus dem Demo-Modus
 
 Die Übersicht zeigt Titel und Projektpfade echter Sitzungen. Ein Screenshot davon
