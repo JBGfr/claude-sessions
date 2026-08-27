@@ -8,6 +8,8 @@ the [Claude Watchdog](https://github.com/JBGfr/claude-watchdog) if that is
 installed, and the current plan usage. Everything it displays it reads from
 local files and from the Claude Code CLI; it opens no network connection.
 
+[![Release](https://img.shields.io/github/v/release/JBGfr/claude-sessions?label=download&color=d97757)](https://github.com/JBGfr/claude-sessions/releases/latest)
+
 ![The overview in demo mode](assets/screenshot.png)
 
 *The screenshot runs in demo mode (`CS_DEMO=1`), so it shows invented sessions
@@ -15,6 +17,24 @@ instead of real titles and paths — see [Screenshots](#screenshots).*
 
 The user interface, the source comments and the commit messages are German.
 This README is the English one; `README.de.md` is the German version.
+
+## Download
+
+Grab the latest release, or clone the repository:
+
+```sh
+# release tarball
+curl -L https://github.com/JBGfr/claude-sessions/archive/refs/tags/v1.0.0.tar.gz | tar xz
+cd claude-sessions-1.0.0 && ./tools/install-desktop.sh
+
+# or the current state
+git clone https://github.com/JBGfr/claude-sessions.git
+cd claude-sessions && ./tools/install-desktop.sh
+```
+
+The installer only creates symlinks, the menu entry and the icons; it starts
+and enables nothing. Requirements are listed below — GTK3 through PyGObject
+comes from your distribution's packages, not from pip.
 
 ## What it shows
 

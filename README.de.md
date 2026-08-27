@@ -9,10 +9,30 @@ ausschliesslich lokale Dateien und die Claude-Code-CLI und öffnet keine
 Netzverbindung. Als App-Icon dient das Block-Art-Maskottchen aus dem
 Claude-Code-Terminal-Header, pixelgenau dekodiert (`tools/make_icons.py`).
 
+[![Release](https://img.shields.io/github/v/release/JBGfr/claude-sessions?label=download&color=d97757)](https://github.com/JBGfr/claude-sessions/releases/latest)
+
 ![Die Übersicht im Demo-Modus](assets/screenshot.png)
 
 *Das Bild entsteht im Demo-Modus (`CS_DEMO=1`) und zeigt erfundene Sitzungen
 statt echter Titel und Pfade — siehe [Screenshots](#screenshots).*
+
+## Herunterladen
+
+Die neueste Fassung als Archiv, oder das Repo klonen:
+
+```sh
+# Release-Archiv
+curl -L https://github.com/JBGfr/claude-sessions/archive/refs/tags/v1.0.0.tar.gz | tar xz
+cd claude-sessions-1.0.0 && ./tools/install-desktop.sh
+
+# oder der aktuelle Stand
+git clone https://github.com/JBGfr/claude-sessions.git
+cd claude-sessions && ./tools/install-desktop.sh
+```
+
+Das Installationsskript legt nur Symlinks, den Menüeintrag und die Icons an;
+es startet und aktiviert nichts. Voraussetzungen stehen weiter unten — GTK3
+über PyGObject kommt aus den Distributionspaketen, nicht aus pip.
 
 ## Was sie zeigt
 
