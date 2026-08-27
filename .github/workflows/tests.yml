@@ -40,7 +40,18 @@ jobs:
       - name: Leck-Gate Selbsttest
         run: python3 tools/leak-check.py --selbsttest
 
-      # Die Units werden nur geprueft, nicht installiert. Ohne User-Instanz
-      # auf dem Runner reicht der System-Modus, %h und Co. sind dort gueltig.
+      # Die Units werden nur geprueft, nicht installiert. systemd-analyze
+      # verlangt aber, dass die ExecStart-Programme existieren und ausfuehrbar
+      # sind - auf einem frischen Runner ist nichts installiert, und die
+      # Pruefung scheiterte an genau dieser Umgebung statt an der Unit.
+      # Deshalb zwei Attrappen an den erwarteten Stellen: geprueft werden dann
+      # Direktiven und Syntax, nicht der Installationszustand des Runners.
       - name: systemd-Units
-        run: systemd-analyze verify --man=no --generators=no systemd/claude-session@.service systemd/claude-sessions-app.service
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          for prog in claude-sessions claude-session-runner; do
+            printf '#!/bin/sh\n' > "$HOME/.local/bin/$prog"
+            chmod +x "$HOME/.local/bin/$prog"
+          done
+          systemd-analyze verify --man=no --generators=no \
+            systemd/claude-session@.service systemd/claude-sessions-app.service

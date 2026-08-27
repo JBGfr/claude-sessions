@@ -13,6 +13,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from claude_sessions import actions  # noqa: E402
 
 
+
+def festes_terminal(name: str = "xterm"):
+    """Terminalwahl festnageln — sonst prueft der Test die Testmaschine.
+
+    Auf der Entwicklungskiste liegt qterminal, auf einem CI-Runner gar kein
+    Terminal. Genau daran sind vier Tests am 2026-08-21 in der CI gescheitert,
+    waehrend sie lokal gruen waren.
+    """
+    return unittest.mock.patch.object(
+        actions.shutil, "which",
+        side_effect=lambda n: "/usr/bin/%s" % n if n == name else None)
+
+
 class FakeCompleted:
     def __init__(self, returncode: int) -> None:
         self.returncode = returncode
@@ -165,11 +178,13 @@ class SpawnCallerTest(unittest.TestCase):
         self.assertEqual(self.calls[0][0], ["xdg-open", "/home/user/Projekte"])
 
     def test_live_log(self) -> None:
-        self.assertTrue(actions.show_live_log())
-        self.assertEqual(self.calls[0][0][:2], ["qterminal", "-e"])
+        with festes_terminal():
+            self.assertTrue(actions.show_live_log())
+        self.assertEqual(self.calls[0][0][:2], ["xterm", "-e"])
 
     def test_watchdog_logs_maskiert_die_task_id(self) -> None:
-        actions.show_watchdog_logs("task; rm -rf ~")
+        with festes_terminal():
+            actions.show_watchdog_logs("task; rm -rf ~")
         script = self.calls[0][0][-1]
         self.assertIn("'task; rm -rf ~'", script)
 
@@ -201,10 +216,11 @@ class AttachSessionTest(unittest.TestCase):
         calls = []
         with unittest.mock.patch.object(
                 actions, "_spawn_detached",
-                lambda argv, desc: (calls.append((argv, desc)), True)[1]):
+                lambda argv, desc: (calls.append((argv, desc)), True)[1]), \
+             festes_terminal():
             self.assertTrue(actions.attach_session("zsh-menu"))
         argv, desc = calls[0]
-        self.assertEqual(argv[:2], ["qterminal", "-e"])
+        self.assertEqual(argv[:2], ["xterm", "-e"])
         self.assertIn("claude-sessionctl attach zsh-menu", argv[-1])
         self.assertIn("zsh-menu", desc)
 
@@ -212,7 +228,8 @@ class AttachSessionTest(unittest.TestCase):
         calls = []
         with unittest.mock.patch.object(
                 actions, "_spawn_detached",
-                lambda argv, desc: (calls.append(argv), True)[1]):
+                lambda argv, desc: (calls.append(argv), True)[1]), \
+             festes_terminal():
             actions.attach_session("boes; rm -rf ~")
         self.assertIn("'boes; rm -rf ~'", calls[0][-1])
 
